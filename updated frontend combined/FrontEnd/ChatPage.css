@@ -1,0 +1,82 @@
+/* Entire page background and font */
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #ffffff;
+  font-family: Arial, sans-serif;
+}
+
+/* Header */
+.header {
+  background-color: #a08a3c;
+  padding: 20px 0;
+  text-align: center;
+  font-size: 36px;
+  font-weight: bold;
+  color: black;
+  border-bottom: 2px solid black;
+}
+
+/* Chat container layout */
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 90vh;
+  padding: 0 80px;
+  justify-content: flex-end;
+}
+
+/* Spacer to push content downward */
+.spacer {
+  flex-grow: 1;
+}
+
+/* Message display block */
+.message-block {
+  margin-bottom: 20px;
+}
+
+.sender-name {
+  font-weight: bold;
+  margin-bottom: 5px;
+}
+
+.message-bubble {
+  background-color: #a08a3c;
+  color: white;
+  padding: 10px 40px;
+  border-radius: 15px;
+  width: fit-content;
+  border: 2px solid black;
+}
+
+/* Message input area */
+.message-input {
+  display: flex;
+  align-items: center;
+  margin-bottom: 30px;
+}
+
+.message-input input[type="text"] {
+  flex: 1;
+  padding: 10px;
+  font-size: 16px;
+  border: 2px solid black;
+  border-radius: 15px;
+  margin-right: 10px;
+  box-sizing: border-box;
+}
+
+.message-input button {
+  padding: 10px 20px;
+  font-size: 16px;
+  font-weight: bold;
+  background-color: #e5dab1;
+  border: 2px solid black;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.message-input button:hover {
+  background-color: #d1c38c;
+}
