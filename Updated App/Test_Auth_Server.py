@@ -2,127 +2,206 @@ import socket
 import threading
 import hashlib
 import secrets
+import sqlite3
+import json
+from contextlib import contextmanager
 
-# In-memory storage
-users = {}  # {username: (hashed_password, token, two_factor_code, security_questions)}
-logged_in_clients = {}  # {conn: (username, token)} for tracking active clients
+# In-memory storage for active clients
+logged_in_clients = {}  # {conn: (username, token)}
 
 HOST = '127.0.0.1'
 PORT = 65433
 
+# Database setup
+def init_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            hashed_password TEXT NOT NULL,
+            two_factor_code TEXT NOT NULL UNIQUE,
+            security_answer1 TEXT NOT NULL,
+            security_answer2 TEXT NOT NULL,
+            token TEXT
+        )
+    ''')
+    conn.commit()
+    c.execute("PRAGMA table_info(users)")
+    schema = c.fetchall()
+    print("Database schema:", schema)
+    conn.close()
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect('users.db')
+    try:
+        yield conn
+    finally:
+        conn.close()
+
 def hash_password(password):
-    """Hash a password using SHA-256."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def generate_2fa_code():
-    """Generate a 6-digit 2FA code."""
-    return str(secrets.randbelow(900000) + 100000)  # Ensures a 6-digit number
+    max_attempts = 10
+    for _ in range(max_attempts):
+        code = str(secrets.randbelow(900000) + 100000)
+        with get_db() as db:
+            c = db.cursor()
+            c.execute("SELECT 1 FROM users WHERE two_factor_code = ?", (code,))
+            if not c.fetchone():
+                return code
+    raise ValueError("Unable to generate a unique 2FA code after multiple attempts")
+
+def send_response(conn, response):
+    try:
+        conn.sendall((json.dumps(response) + "\n").encode('utf-8'))
+    except ConnectionError as e:
+        print(f"Failed to send response: {e}")
 
 def broadcast_message(sender_conn, message):
-    """Send a chat message to all logged-in clients including the sender."""
     sender_username = logged_in_clients[sender_conn][0]
-    formatted_message = f"CHAT {sender_username}: {message}"
+    response = {"type": "CHAT", "message": f"{sender_username}: {message}"}
     for client_conn in list(logged_in_clients.keys()):
-        try:
-            client_conn.sendall(formatted_message.encode('utf-8'))
-        except ConnectionError:
-            del logged_in_clients[client_conn]
-            client_conn.close()
+        send_response(client_conn, response)
 
 def handle_client(conn, addr):
-    """Handle individual client connections."""
     print(f"New connection from {addr}")
+    buffer = ""
     try:
         while True:
             data = conn.recv(1024).decode('utf-8')
             if not data:
                 break
-            parts = data.split()
-            if len(parts) < 2:
-                conn.sendall(b"ERROR Invalid command format")
-                continue
-
-            command = parts[0]
-
-            if command == "REGISTER":
-                if len(parts) != 6:  # username password q1 a1 q2 a2
-                    conn.sendall(b"ERROR Usage: REGISTER username password q1 a1 q2 a2")
+            buffer += data
+            while '\n' in buffer:
+                message, buffer = buffer.split('\n', 1)
+                try:
+                    request = json.loads(message)
+                    print(f"Received request: {request}")
+                except json.JSONDecodeError as e:
+                    print(f"Invalid JSON: {e}")
+                    send_response(conn, {"type": "ERROR", "message": "Invalid request format"})
                     continue
 
-                username, password, q1, a1, q2, a2 = parts[1:7]
-                username = username.replace("_", " ")
-                password = password.replace("_", " ")
-                q1 = q1.replace("_", " ")
-                a1 = a1.replace("_", " ")
-                q2 = q2.replace("_", " ")
-                a2 = a2.replace("_", " ")
+                request_type = request.get("type")
 
-                if username in users:
-                    conn.sendall(b"ERROR Username already exists")
-                else:
-                    hashed_pw = hash_password(password)
-                    two_factor_code = generate_2fa_code()
-                    security_questions = {q1: a1.lower(), q2: a2.lower()}
-                    users[username] = (hashed_pw, None, two_factor_code, security_questions)
-                    conn.sendall(f"SUCCESS User registered. Your 2FA code is: {two_factor_code}".encode('utf-8'))
+                if request_type == "REGISTER":
+                    username = request.get("username")
+                    password = request.get("password")
+                    answer1 = request.get("answer1")
+                    answer2 = request.get("answer2")
 
-            elif command == "LOGIN":
-                if len(parts) != 4:  # username, password, 2fa_code
-                    conn.sendall(b"ERROR Usage: LOGIN username password 2fa_code")
-                    continue
-                username, password, two_fa_input = parts[1], parts[2], parts[3]
-                username = username.replace("_", " ")
-                password = password.replace("_", " ")
-                two_fa_input = two_fa_input.replace("_", " ")
-                if (username in users and
-                    users[username][0] == hash_password(password) and
-                    users[username][2] == two_fa_input):
-                    token = secrets.token_hex(16)
-                    users[username] = (users[username][0], token, users[username][2], users[username][3])
-                    logged_in_clients[conn] = (username, token)
-                    conn.sendall(f"SUCCESS Token: {token}".encode('utf-8'))
-                else:
-                    conn.sendall(b"ERROR Invalid username, password, or 2FA code")
+                    if not all([username, password, answer1, answer2]):
+                        send_response(conn, {"type": "ERROR", "message": "All fields are required"})
+                        continue
 
-            elif command == "RECOVER":
-                if len(parts) == 2:
-                    username = parts[1].replace("_", " ")
-                    if username in users:
-                        questions = list(users[username][3].keys())
-                        q1 = questions[0].replace(" ", "_")
-                        q2 = questions[1].replace(" ", "_")
-                        conn.sendall(f"QUESTIONS {q1} {q2}".encode('utf-8'))
-                    else:
-                        conn.sendall(b"ERROR Username not found")
-                elif len(parts) == 5 and parts[1] == "VERIFY":
-                    username, a1, a2 = parts[2], parts[3], parts[4]
-                    username = username.replace("_", " ")
-                    a1 = a1.replace("_", " ")
-                    a2 = a2.replace("_", " ")
-                    if username in users:
-                        sec_questions = users[username][3]
-                        if (sec_questions[list(sec_questions.keys())[0]] == a1.lower() and
-                            sec_questions[list(sec_questions.keys())[1]] == a2.lower()):
-                            new_2fa_code = generate_2fa_code()
-                            users[username] = (users[username][0], users[username][1], new_2fa_code, sec_questions)
-                            conn.sendall(f"SUCCESS New 2FA code: {new_2fa_code}".encode('utf-8'))
-                        else:
-                            conn.sendall(b"ERROR Incorrect answers")
-                    else:
-                        conn.sendall(b"ERROR Username not found")
-                else:
-                    conn.sendall(b"ERROR Usage: RECOVER username or RECOVER VERIFY username answer1 answer2")
+                    try:
+                        with get_db() as db:
+                            c = db.cursor()
+                            c.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+                            if c.fetchone():
+                                send_response(conn, {"type": "ERROR", "message": "Username already exists"})
+                            else:
+                                hashed_pw = hash_password(password)
+                                try:
+                                    two_factor_code = generate_2fa_code()
+                                except ValueError as e:
+                                    send_response(conn, {"type": "ERROR", "message": str(e)})
+                                    continue
+                                c.execute('''
+                                    INSERT INTO users (username, hashed_password, two_factor_code, 
+                                    security_answer1, security_answer2, token)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                ''', (username, hashed_pw, two_factor_code, answer1.lower(), answer2.lower(), None))
+                                db.commit()
+                                send_response(conn, {"type": "SUCCESS", "message": f"User registered. Your 2FA code is: {two_factor_code}"})
+                    except sqlite3.Error as e:
+                        print(f"Database error during REGISTER: {e}")
+                        send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
 
-            elif command == "CHAT":
-                if conn not in logged_in_clients:
-                    conn.sendall(b"ERROR You must log in to chat")
-                elif len(parts) < 2:
-                    conn.sendall(b"ERROR Usage: CHAT message")
-                else:
-                    message = " ".join(parts[1:])
+                elif request_type == "LOGIN":
+                    username = request.get("username")
+                    password = request.get("password")
+                    two_fa_input = request.get("two_fa_code")
+
+                    if not all([username, password, two_fa_input]):
+                        send_response(conn, {"type": "ERROR", "message": "All fields are required"})
+                        continue
+
+                    try:
+                        with get_db() as db:
+                            c = db.cursor()
+                            c.execute("SELECT hashed_password, two_factor_code FROM users WHERE username = ?", (username,))
+                            result = c.fetchone()
+                            if result and result[0] == hash_password(password) and result[1] == two_fa_input:
+                                token = secrets.token_hex(16)
+                                c.execute("UPDATE users SET token = ? WHERE username = ?", (token, username))
+                                db.commit()
+                                logged_in_clients[conn] = (username, token)
+                                send_response(conn, {"type": "SUCCESS", "message": f"Login successful. Token: {token}"})
+                            else:
+                                send_response(conn, {"type": "ERROR", "message": "Invalid username, password, or 2FA code"})
+                    except sqlite3.Error as e:
+                        print(f"Database error during LOGIN: {e}")
+                        send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
+
+                elif request_type == "RECOVER":
+                    username = request.get("username")
+                    answer1 = request.get("answer1")
+                    answer2 = request.get("answer2")
+
+                    if not username:
+                        send_response(conn, {"type": "ERROR", "message": "Username is required"})
+                        continue
+
+                    try:
+                        with get_db() as db:
+                            c = db.cursor()
+                            if answer1 is None and answer2 is None:
+                                c.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+                                if c.fetchone():
+                                    send_response(conn, {"type": "QUESTIONS"})
+                                else:
+                                    send_response(conn, {"type": "ERROR", "message": "Username not found"})
+                            else:
+                                if not all([answer1, answer2]):
+                                    send_response(conn, {"type": "ERROR", "message": "Both answers are required"})
+                                    continue
+                                c.execute("SELECT security_answer1, security_answer2 FROM users WHERE username = ?", (username,))
+                                result = c.fetchone()
+                                if result:
+                                    sec_answer1, sec_answer2 = result
+                                    if sec_answer1 == answer1.lower() and sec_answer2 == answer2.lower():
+                                        try:
+                                            new_2fa_code = generate_2fa_code()
+                                        except ValueError as e:
+                                            send_response(conn, {"type": "ERROR", "message": str(e)})
+                                            continue
+                                        c.execute("UPDATE users SET two_factor_code = ? WHERE username = ?", (new_2fa_code, username))
+                                        db.commit()
+                                        send_response(conn, {"type": "SUCCESS", "message": f"New 2FA code: {new_2fa_code}"})
+                                    else:
+                                        send_response(conn, {"type": "ERROR", "message": "Incorrect answers"})
+                                else:
+                                    send_response(conn, {"type": "ERROR", "message": "Username not found"})
+                    except sqlite3.Error as e:
+                        print(f"Database error during RECOVER: {e}")
+                        send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
+
+                elif request_type == "CHAT":
+                    if conn not in logged_in_clients:
+                        send_response(conn, {"type": "ERROR", "message": "You must log in to chat"})
+                        continue
+                    message = request.get("message")
+                    if not message:
+                        send_response(conn, {"type": "ERROR", "message": "Message cannot be empty"})
+                        continue
                     broadcast_message(conn, message)
-            else:
-                conn.sendall(b"ERROR Unknown command")
+
+                else:
+                    send_response(conn, {"type": "ERROR", "message": "Unknown request type"})
     except ConnectionError as e:
         print(f"Connection error with {addr}: {e}")
     finally:
@@ -145,7 +224,7 @@ def start_server():
             print(f"Server started on {HOST}:{port}")
             break
         except OSError as e:
-            if e.errno == 48:  # Address already in use
+            if e.errno == 98:
                 attempt += 1
                 port += 1
                 print(f"Port {port - 1} in use, trying port {port}...")
@@ -168,4 +247,6 @@ def start_server():
         server.close()
 
 if __name__ == "__main__":
+    print("Starting server with updated schema...")
+    init_db()
     start_server()
