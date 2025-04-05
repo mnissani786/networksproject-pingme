@@ -75,6 +75,11 @@ class PingMeApp(tk.Tk):
                         # Only update the status of the current frame
                         if self.current_frame:
                             self.current_frame.update_status(response.get("message"))
+                    elif response_type == "LOGOUT":  # Handle logout response
+                        self.frames[ChatPage].append_message("You have logged out.")
+                        self.sock.close()  # Close the current socket
+                        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Create a new socket for future connections
+                        self.show_frame(MainPage)
                     else:
                         print(f"Unknown response type: {response_type}")
             except ConnectionError as e:
@@ -233,6 +238,7 @@ class ForgotPasswordPage(tk.Frame):
     def show_questions(self):
         self.username_frame.pack_forget()
         self.questions_frame.pack()
+        self.status.config(text="Please answer the security questions.")
 
     def verify_answers(self):
         username = self.username_entry.get().strip()
@@ -252,20 +258,34 @@ class ForgotPasswordPage(tk.Frame):
         self.master.send(request)
 
     def update_status(self, msg):
-        if "New 2FA code" in msg:
+        self.status.config(text=msg)
+        if "Recovery successful" in msg:
             self.questions_frame.pack_forget()
             self.username_frame.pack()
-        self.status.config(text=msg)
 
 class ChatPage(tk.Frame):
     def __init__(self, master):
-        super().__init__(master)
-        tk.Label(self, text="PingMe - Chat", font=("Arial", 16)).pack(pady=10)
-        self.text_area = tk.Text(self, state='disabled', height=20)
-        self.text_area.pack(pady=5)
-        self.entry = tk.Entry(self, width=30)
+        super().__init__(master, bg="#2C2F33")  # Dark background for the frame
+        tk.Label(self, text="PingMe - Chat", font=("Arial", 16), fg="white", bg="#2C2F33").pack(pady=10)
+
+        # Chat area with a border and background
+        self.text_area = tk.Text(self, state='disabled', height=20, bg="#1C2526", fg="white", 
+                                 insertbackground="white", borderwidth=2, relief="solid")
+        self.text_area.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
+
+        # Frame for input and button
+        input_frame = tk.Frame(self, bg="#2C2F33")
+        input_frame.pack(pady=5)
+
+        self.entry = tk.Entry(input_frame, width=30, bg="#40444B", fg="white", 
+                              insertbackground="white", borderwidth=1, relief="solid")
         self.entry.pack(side=tk.LEFT, padx=5)
-        tk.Button(self, text="Send", command=self.send_message).pack(side=tk.LEFT)
+        tk.Button(input_frame, text="Send", command=self.send_message, bg="#7289DA", fg="white", 
+                  borderwidth=1, relief="solid").pack(side=tk.LEFT)
+
+        # Add Log Out button
+        tk.Button(self, text="Log Out", command=self.logout, bg="#FF5555", fg="white", 
+                  borderwidth=1, relief="solid").pack(pady=10)
 
     def send_message(self):
         msg = self.entry.get().strip()
@@ -276,6 +296,10 @@ class ChatPage(tk.Frame):
         request = {"type": "CHAT", "message": msg}
         self.master.send(request)
         self.entry.delete(0, tk.END)
+
+    def logout(self):
+        request = {"type": "LOGOUT"}
+        self.master.send(request)
 
     def append_message(self, msg):
         self.text_area.config(state='normal')

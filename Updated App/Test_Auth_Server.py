@@ -5,6 +5,7 @@ import secrets
 import sqlite3
 import json
 from contextlib import contextmanager
+import os
 
 # In-memory storage for active clients
 logged_in_clients = {}  # {conn: (username, token)}
@@ -12,29 +13,22 @@ logged_in_clients = {}  # {conn: (username, token)}
 HOST = '127.0.0.1'
 PORT = 65433
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            hashed_password TEXT NOT NULL,
-            two_factor_code TEXT NOT NULL UNIQUE,
-            security_answer1 TEXT NOT NULL,
-            security_answer2 TEXT NOT NULL,
-            token TEXT
-        )
-    ''')
-    conn.commit()
-    c.execute("PRAGMA table_info(users)")
-    schema = c.fetchall()
-    print("Database schema:", schema)
-    conn.close()
+# Use the directory where the script is running
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'users.db')
+
+# Check if the database file exists
+if not os.path.exists(DB_PATH):
+    raise FileNotFoundError(f"Database file not found at {DB_PATH}. Please create users.db manually with the correct schema.")
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect('users.db')
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        print(f"Successfully connected to database at {DB_PATH}")
+    except sqlite3.Error as e:
+        print(f"Failed to connect to database at {DB_PATH}: {e}")
+        raise
     try:
         yield conn
     finally:
@@ -110,11 +104,12 @@ def handle_client(conn, addr):
                                 except ValueError as e:
                                     send_response(conn, {"type": "ERROR", "message": str(e)})
                                     continue
+                                # Store both the hashed and plaintext password
                                 c.execute('''
-                                    INSERT INTO users (username, hashed_password, two_factor_code, 
+                                    INSERT INTO users (username, hashed_password, plaintext_password, two_factor_code, 
                                     security_answer1, security_answer2, token)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                ''', (username, hashed_pw, two_factor_code, answer1.lower(), answer2.lower(), None))
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ''', (username, hashed_pw, password, two_factor_code, answer1.lower(), answer2.lower(), None))
                                 db.commit()
                                 send_response(conn, {"type": "SUCCESS", "message": f"User registered. Your 2FA code is: {two_factor_code}"})
                     except sqlite3.Error as e:
@@ -160,28 +155,24 @@ def handle_client(conn, addr):
                         with get_db() as db:
                             c = db.cursor()
                             if answer1 is None and answer2 is None:
+                                # First step: Check if username exists and prompt for security questions
                                 c.execute("SELECT 1 FROM users WHERE username = ?", (username,))
                                 if c.fetchone():
                                     send_response(conn, {"type": "QUESTIONS"})
                                 else:
                                     send_response(conn, {"type": "ERROR", "message": "Username not found"})
                             else:
+                                # Second step: Verify security answers and return original password and 2FA code
                                 if not all([answer1, answer2]):
                                     send_response(conn, {"type": "ERROR", "message": "Both answers are required"})
                                     continue
-                                c.execute("SELECT security_answer1, security_answer2 FROM users WHERE username = ?", (username,))
+                                c.execute("SELECT security_answer1, security_answer2, plaintext_password, two_factor_code FROM users WHERE username = ?", (username,))
                                 result = c.fetchone()
                                 if result:
-                                    sec_answer1, sec_answer2 = result
+                                    sec_answer1, sec_answer2, plaintext_password, two_factor_code = result
                                     if sec_answer1 == answer1.lower() and sec_answer2 == answer2.lower():
-                                        try:
-                                            new_2fa_code = generate_2fa_code()
-                                        except ValueError as e:
-                                            send_response(conn, {"type": "ERROR", "message": str(e)})
-                                            continue
-                                        c.execute("UPDATE users SET two_factor_code = ? WHERE username = ?", (new_2fa_code, username))
-                                        db.commit()
-                                        send_response(conn, {"type": "SUCCESS", "message": f"New 2FA code: {new_2fa_code}"})
+                                        # Return the original plaintext password and 2FA code
+                                        send_response(conn, {"type": "SUCCESS", "message": f"Recovery successful. Your password is: {plaintext_password}. Your 2FA code is: {two_factor_code}"})
                                     else:
                                         send_response(conn, {"type": "ERROR", "message": "Incorrect answers"})
                                 else:
@@ -199,6 +190,23 @@ def handle_client(conn, addr):
                         send_response(conn, {"type": "ERROR", "message": "Message cannot be empty"})
                         continue
                     broadcast_message(conn, message)
+
+                elif request_type == "LOGOUT":
+                    if conn in logged_in_clients:
+                        username, _ = logged_in_clients[conn]
+                        try:
+                            with get_db() as db:
+                                c = db.cursor()
+                                c.execute("UPDATE users SET token = ? WHERE username = ?", (None, username))
+                                db.commit()
+                        except sqlite3.Error as e:
+                            print(f"Database error during LOGOUT: {e}")
+                            send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
+                            continue
+                        del logged_in_clients[conn]
+                        send_response(conn, {"type": "LOGOUT", "message": "Logged out successfully"})
+                    else:
+                        send_response(conn, {"type": "ERROR", "message": "Not logged in"})
 
                 else:
                     send_response(conn, {"type": "ERROR", "message": "Unknown request type"})
@@ -247,6 +255,5 @@ def start_server():
         server.close()
 
 if __name__ == "__main__":
-    print("Starting server with updated schema...")
-    init_db()
+    print(f"Connecting to database at {DB_PATH}...")
     start_server()
