@@ -1,40 +1,39 @@
 import socket
 import threading
-#threading allows multiple threads in a python program
-#basically, multiple users can connect to the server and not have to wait for each other when sending and recieving messages
 import hashlib
 import secrets
 
 # In-memory storage
-users = {}  # {username: (hashed_password, token)}
+users = {}  # {username: (hashed_password, token, two_factor_code, security_questions)}
 logged_in_clients = {}  # {conn: (username, token)} for tracking active clients
+
 HOST = '127.0.0.1'
-PORT = 65432
+PORT = 65433
 
 def hash_password(password):
     """Hash a password using SHA-256."""
     return hashlib.sha256(password.encode()).hexdigest()
 
+def generate_2fa_code():
+    """Generate a 6-digit 2FA code."""
+    return str(secrets.randbelow(900000) + 100000)  # Ensures a 6-digit number
+
 def broadcast_message(sender_conn, message):
     """Send a chat message to all logged-in clients including the sender."""
-    sender_username = logged_in_clients[sender_conn][0]  # Get sender's username
-    formatted_message = f"CHAT {sender_username}: {message}"  # Format message with sender's username
-    for client_conn in logged_in_clients.keys():
+    sender_username = logged_in_clients[sender_conn][0]
+    formatted_message = f"CHAT {sender_username}: {message}"
+    for client_conn in list(logged_in_clients.keys()):
         try:
             client_conn.sendall(formatted_message.encode('utf-8'))
         except ConnectionError:
-            del logged_in_clients[client_conn]  # Remove disconnected clients
+            del logged_in_clients[client_conn]
             client_conn.close()
 
-
-#handles communication between client and server, runs for each new client connected
 def handle_client(conn, addr):
     """Handle individual client connections."""
-    print(f"New connection from {addr}") #Announces the connection of a new connected user
+    print(f"New connection from {addr}")
     try:
         while True:
-            # recieves a message from the client of 1024 bytes
-            # .decode decodes the message from a bytes format into a string using utf-8
             data = conn.recv(1024).decode('utf-8')
             if not data:
                 break
@@ -42,51 +41,86 @@ def handle_client(conn, addr):
             if len(parts) < 2:
                 conn.sendall(b"ERROR Invalid command format")
                 continue
+
             command = parts[0]
 
             if command == "REGISTER":
-                if len(parts) != 3:
-                    conn.sendall(b"ERROR Usage: REGISTER username password")
+                if len(parts) != 6:  # username password q1 a1 q2 a2
+                    conn.sendall(b"ERROR Usage: REGISTER username password q1 a1 q2 a2")
                     continue
-                username, password = parts[1], parts[2]
+
+                username, password, q1, a1, q2, a2 = parts[1:7]
+                username = username.replace("_", " ")
+                password = password.replace("_", " ")
+                q1 = q1.replace("_", " ")
+                a1 = a1.replace("_", " ")
+                q2 = q2.replace("_", " ")
+                a2 = a2.replace("_", " ")
+
                 if username in users:
                     conn.sendall(b"ERROR Username already exists")
                 else:
                     hashed_pw = hash_password(password)
-                    users[username] = (hashed_pw, None)
-                    conn.sendall(b"SUCCESS User registered successfully")
-           
+                    two_factor_code = generate_2fa_code()
+                    security_questions = {q1: a1.lower(), q2: a2.lower()}
+                    users[username] = (hashed_pw, None, two_factor_code, security_questions)
+                    conn.sendall(f"SUCCESS User registered. Your 2FA code is: {two_factor_code}".encode('utf-8'))
+
             elif command == "LOGIN":
-                if len(parts) != 3:
-                    conn.sendall(b"ERROR Usage: LOGIN username password")
+                if len(parts) != 4:  # username, password, 2fa_code
+                    conn.sendall(b"ERROR Usage: LOGIN username password 2fa_code")
                     continue
-                username, password = parts[1], parts[2]
-                if username in users and users[username][0] == hash_password(password):
+                username, password, two_fa_input = parts[1], parts[2], parts[3]
+                username = username.replace("_", " ")
+                password = password.replace("_", " ")
+                two_fa_input = two_fa_input.replace("_", " ")
+                if (username in users and
+                    users[username][0] == hash_password(password) and
+                    users[username][2] == two_fa_input):
                     token = secrets.token_hex(16)
-                    users[username] = (users[username][0], token)
-                    logged_in_clients[conn] = (username, token)  # Add to logged-in list
+                    users[username] = (users[username][0], token, users[username][2], users[username][3])
+                    logged_in_clients[conn] = (username, token)
                     conn.sendall(f"SUCCESS Token: {token}".encode('utf-8'))
                 else:
-                    conn.sendall(b"ERROR Invalid username or password")
-           
+                    conn.sendall(b"ERROR Invalid username, password, or 2FA code")
+
             elif command == "RECOVER":
-                if len(parts) != 2:
-                    conn.sendall(b"ERROR Usage: RECOVER username")
-                    continue
-                username = parts[1]
-                if username in users:
-                    conn.sendall(b"SUCCESS Recovery code: 12345")
+                if len(parts) == 2:
+                    username = parts[1].replace("_", " ")
+                    if username in users:
+                        questions = list(users[username][3].keys())
+                        q1 = questions[0].replace(" ", "_")
+                        q2 = questions[1].replace(" ", "_")
+                        conn.sendall(f"QUESTIONS {q1} {q2}".encode('utf-8'))
+                    else:
+                        conn.sendall(b"ERROR Username not found")
+                elif len(parts) == 5 and parts[1] == "VERIFY":
+                    username, a1, a2 = parts[2], parts[3], parts[4]
+                    username = username.replace("_", " ")
+                    a1 = a1.replace("_", " ")
+                    a2 = a2.replace("_", " ")
+                    if username in users:
+                        sec_questions = users[username][3]
+                        if (sec_questions[list(sec_questions.keys())[0]] == a1.lower() and
+                            sec_questions[list(sec_questions.keys())[1]] == a2.lower()):
+                            new_2fa_code = generate_2fa_code()
+                            users[username] = (users[username][0], users[username][1], new_2fa_code, sec_questions)
+                            conn.sendall(f"SUCCESS New 2FA code: {new_2fa_code}".encode('utf-8'))
+                        else:
+                            conn.sendall(b"ERROR Incorrect answers")
+                    else:
+                        conn.sendall(b"ERROR Username not found")
                 else:
-                    conn.sendall(b"ERROR Username not found")
-           
-            elif command == "CHAT":                
+                    conn.sendall(b"ERROR Usage: RECOVER username or RECOVER VERIFY username answer1 answer2")
+
+            elif command == "CHAT":
                 if conn not in logged_in_clients:
                     conn.sendall(b"ERROR You must log in to chat")
                 elif len(parts) < 2:
                     conn.sendall(b"ERROR Usage: CHAT message")
                 else:
                     message = " ".join(parts[1:])
-                    broadcast_message(conn, message)  # Broadcast to all including sender
+                    broadcast_message(conn, message)
             else:
                 conn.sendall(b"ERROR Unknown command")
     except ConnectionError as e:
@@ -94,28 +128,44 @@ def handle_client(conn, addr):
     finally:
         if conn in logged_in_clients:
             del logged_in_clients[conn]
-        conn.close() #Cleanly disconnects client from server 
+        conn.close()
         print(f"Connection closed with {addr}")
 
 def start_server():
-    """Start the TCP server and listen for connections."""
-    # AF_INET accepts IPV4 addresses over the internet, other types of sockets accept other types (like AF_INET accepts IPV6 addresses)
-    # socket.SOCK_STREAM allows the streaming of data through the socket through TCP
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    port = PORT
+    attempt = 0
+    max_attempts = 10
+
+    while attempt < max_attempts:
+        try:
+            server.bind((HOST, port))
+            server.listen()
+            print(f"Server started on {HOST}:{port}")
+            break
+        except OSError as e:
+            if e.errno == 48:  # Address already in use
+                attempt += 1
+                port += 1
+                print(f"Port {port - 1} in use, trying port {port}...")
+            else:
+                print(f"Server error: {e}")
+                server.close()
+                return
+    else:
+        print("Failed to bind to any port.")
+        return
+
     try:
-        server.bind((HOST, PORT)) # Binds the socket to the HOST and PORT
-        server.listen() # listens for connections and passes them off to the handle_client
-        print(f"Server started on {HOST}:{PORT}")
         while True:
-            conn, addr = server.accept() # waits for a new connection to the server, stores what address and port number the connection came from to send info back
-            thread = threading.Thread(target=handle_client, args=(conn, addr)) # this allows multiple handle_client() functions to run at once
-            thread.start() # starts the thread
+            conn, addr = server.accept()
+            thread = threading.Thread(target=handle_client, args=(conn, addr))
+            thread.start()
     except Exception as e:
-        print(f"Server error: {e}") # Displays any error messages
+        print(f"Server error: {e}")
     finally:
         server.close()
 
 if __name__ == "__main__":
     start_server()
-    
