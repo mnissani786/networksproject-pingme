@@ -13,6 +13,7 @@ class PingMeApp(tk.Tk):
         self.title("PingMe")
         self.geometry("400x600")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.token = None  # Store the session token after login
         try:
             print(f"Connecting to {HOST}:{PORT}")
             self.sock.connect((HOST, PORT))
@@ -33,21 +34,56 @@ class PingMeApp(tk.Tk):
         self.listen_thread = threading.Thread(target=self.listen_for_messages, daemon=True)
         self.listen_thread.start()
 
+    def reconnect(self):
+        """Reconnect the socket to the server if it's disconnected."""
+        try:
+            self.sock.close()  # Close the existing socket
+        except:
+            pass
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            print(f"Reconnecting to {HOST}:{PORT}")
+            self.sock.connect((HOST, PORT))
+            print("Reconnection successful")
+        except ConnectionError as e:
+            print(f"Reconnection failed: {e}")
+            if self.current_frame:
+                self.current_frame.update_status(f"Error: Failed to reconnect to server - {e}")
+            return False
+        return True
+
     def show_frame(self, page):
         if self.current_frame == self.frames[RegisterPage]:
             self.frames[RegisterPage].clear_status()  # Clear the status when leaving RegisterPage
+        if self.current_frame == self.frames[LoginPage]:
+            self.frames[LoginPage].clear_status()  # Clear the status when leaving LoginPage
+        # Clear chat messages when navigating to ChatPage (on login)
+        if page == ChatPage:
+            self.frames[ChatPage].clear_messages()
         self.frames[page].tkraise()
         self.current_frame = self.frames[page]  # Update the current frame
 
     def send(self, request):
+        # Include the token in requests if it exists (except for REGISTER and initial RECOVER)
+        if self.token and request.get("type") not in ["REGISTER", "RECOVER"]:
+            request["token"] = self.token
         message = json.dumps(request)
         print(f"Sending request: {message}")
         try:
             self.sock.sendall(f"{message}\n".encode('utf-8'))
-        except ConnectionError as e:
+        except (ConnectionError, OSError) as e:
             print(f"Failed to send request: {e}")
-            if self.current_frame:
-                self.current_frame.update_status(f"Error: Connection to server lost - {e}")
+            # Attempt to reconnect and retry sending
+            if self.reconnect():
+                try:
+                    self.sock.sendall(f"{message}\n".encode('utf-8'))
+                except ConnectionError as e2:
+                    print(f"Retry failed: {e2}")
+                    if self.current_frame:
+                        self.current_frame.update_status(f"Error: Connection to server lost - {e2}")
+            else:
+                if self.current_frame:
+                    self.current_frame.update_status(f"Error: Connection to server lost - {e}")
 
     def listen_for_messages(self):
         buffer = ""
@@ -71,18 +107,30 @@ class PingMeApp(tk.Tk):
                         self.frames[ChatPage].append_message(response.get("message"))
                     elif response_type == "QUESTIONS":
                         self.frames[ForgotPasswordPage].show_questions()
-                    elif response_type == "SUCCESS" or response_type == "ERROR":
-                        # Only update the status of the current frame
+                    elif response_type == "SUCCESS":
+                        message = response.get("message")
+                        if "Login successful" in message:
+                            # Extract and store the token, but don't display it in the UI
+                            self.token = message.split("Token: ")[1]
+                            print(f"Stored token: {self.token}")
+                            self.frames[LoginPage].update_status("Login successful")
+                        else:
+                            if self.current_frame:
+                                self.current_frame.update_status(message)
+                    elif response_type == "ERROR":
                         if self.current_frame:
                             self.current_frame.update_status(response.get("message"))
-                    elif response_type == "LOGOUT":  # Handle logout response
+                    elif response_type == "LOGOUT":
+                        self.token = None  # Clear the token on logout
                         self.frames[ChatPage].append_message("You have logged out.")
-                        self.sock.close()  # Close the current socket
-                        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Create a new socket for future connections
+                        # Clear chat messages on logout
+                        self.frames[ChatPage].clear_messages()
+                        # Reconnect the socket after logout
+                        self.reconnect()
                         self.show_frame(MainPage)
                     else:
                         print(f"Unknown response type: {response_type}")
-            except ConnectionError as e:
+            except (ConnectionError, OSError) as e:
                 print(f"Connection error in listen thread: {e}")
                 if self.current_frame:
                     self.current_frame.update_status(f"Error: Connection to server lost - {e}")
@@ -201,6 +249,9 @@ class LoginPage(tk.Frame):
             self.master.show_frame(ChatPage)
         self.status.config(text=msg)
 
+    def clear_status(self):
+        self.status.config(text="")  # Clear the status label when leaving the page
+
 class ForgotPasswordPage(tk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -306,6 +357,11 @@ class ChatPage(tk.Frame):
         self.text_area.insert(tk.END, msg + "\n")
         self.text_area.config(state='disabled')
         self.text_area.see(tk.END)
+
+    def clear_messages(self):
+        self.text_area.config(state='normal')
+        self.text_area.delete(1.0, tk.END)
+        self.text_area.config(state='disabled')
 
     def update_status(self, msg):
         self.append_message(msg)

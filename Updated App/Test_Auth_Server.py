@@ -48,6 +48,21 @@ def generate_2fa_code():
                 return code
     raise ValueError("Unable to generate a unique 2FA code after multiple attempts")
 
+def verify_token(token):
+    if not token:
+        return None
+    try:
+        with get_db() as db:
+            c = db.cursor()
+            c.execute("SELECT username FROM users WHERE token = ?", (token,))
+            result = c.fetchone()
+            if result:
+                return result[0]  # Return the username associated with the token
+            return None
+    except sqlite3.Error as e:
+        print(f"Database error during token verification: {e}")
+        return None
+
 def send_response(conn, response):
     try:
         conn.sendall((json.dumps(response) + "\n").encode('utf-8'))
@@ -182,9 +197,15 @@ def handle_client(conn, addr):
                         send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
 
                 elif request_type == "CHAT":
-                    if conn not in logged_in_clients:
-                        send_response(conn, {"type": "ERROR", "message": "You must log in to chat"})
+                    # Verify the token in the request
+                    token = request.get("token")
+                    username = verify_token(token)
+                    if not username:
+                        send_response(conn, {"type": "ERROR", "message": "Invalid or missing token"})
                         continue
+                    # Ensure the connection is in logged_in_clients
+                    if conn not in logged_in_clients:
+                        logged_in_clients[conn] = (username, token)
                     message = request.get("message")
                     if not message:
                         send_response(conn, {"type": "ERROR", "message": "Message cannot be empty"})
@@ -192,21 +213,24 @@ def handle_client(conn, addr):
                     broadcast_message(conn, message)
 
                 elif request_type == "LOGOUT":
+                    # Verify the token in the request
+                    token = request.get("token")
+                    username = verify_token(token)
+                    if not username:
+                        send_response(conn, {"type": "ERROR", "message": "Invalid or missing token"})
+                        continue
+                    try:
+                        with get_db() as db:
+                            c = db.cursor()
+                            c.execute("UPDATE users SET token = ? WHERE username = ?", (None, username))
+                            db.commit()
+                    except sqlite3.Error as e:
+                        print(f"Database error during LOGOUT: {e}")
+                        send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
+                        continue
                     if conn in logged_in_clients:
-                        username, _ = logged_in_clients[conn]
-                        try:
-                            with get_db() as db:
-                                c = db.cursor()
-                                c.execute("UPDATE users SET token = ? WHERE username = ?", (None, username))
-                                db.commit()
-                        except sqlite3.Error as e:
-                            print(f"Database error during LOGOUT: {e}")
-                            send_response(conn, {"type": "ERROR", "message": f"Database error: {e}"})
-                            continue
                         del logged_in_clients[conn]
-                        send_response(conn, {"type": "LOGOUT", "message": "Logged out successfully"})
-                    else:
-                        send_response(conn, {"type": "ERROR", "message": "Not logged in"})
+                    send_response(conn, {"type": "LOGOUT", "message": "Logged out successfully"})
 
                 else:
                     send_response(conn, {"type": "ERROR", "message": "Unknown request type"})
