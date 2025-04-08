@@ -41,9 +41,9 @@ class PingMeApp(tk.Tk):
         self.listen_thread.start()
 
     def enter_server(self):
-        host = input(f"Enter the server ip: ")
-        port = int(input(f"Enter the server port number: "))
-        return host, port
+        self.host = input(f"Enter the server ip: ")
+        self.port = int(input(f"Enter the server port number: "))
+        return self.host, self.port
 
     def reconnect(self):
         try: self.sock.close()
